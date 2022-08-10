@@ -7,6 +7,15 @@ local M = {}
 --- to throttle refreshes to at most one at a time
 local active_refreshes = {}
 
+--- bufnr -> lnum -> padding
+local padding_cache_by_buf = setmetatable({}, {
+  __index = function(t, b)
+    local key = b > 0 and b or api.nvim_get_current_buf()
+    t[key] = {}
+    return rawget(t, key)
+  end,
+})
+
 --- bufnr -> lnum -> extmark
 local extmarks_cache_by_buf = setmetatable({}, {
   __index = function(t, b)
@@ -69,6 +78,20 @@ local function execute_lens(lens, bufnr, client_id)
   end, bufnr)
 end
 
+local function get_padding_lnum(bufnr, lnum)
+  if not padding_cache_by_buf[bufnr][lnum] then
+    local line = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, true)[1]
+
+    local _, first = line:find('^%s*.')
+    first = first and first - 1 or 0
+
+    local padding = string.rep(' ', first)
+    padding_cache_by_buf[bufnr][lnum] = padding
+  end
+
+  return padding_cache_by_buf[bufnr][lnum]
+end
+
 --- Return all lenses for the given buffer
 ---
 ---@param bufnr number  Buffer number. 0 can be used for the current buffer.
@@ -90,8 +113,17 @@ local function set_extmark(chunks, bufnr, i, ns, prev_extmarks)
   local opts = {
     id = id,
     hl_mode = 'combine',
-    virt_text = chunks,
   }
+
+  -- TODO make it optional; see vim.lsp.with
+
+  -- https://github.com/neovim/neovim/issues/16166
+  if i > 1 then
+    opts.virt_lines = { chunks }
+    opts.virt_lines_above = true
+  else
+    opts.virt_text = chunks
+  end
 
   if id then
     -- may raise 'line value outside range' outside range
@@ -183,7 +215,13 @@ function M.display(lenses, bufnr, client_id, prev_extmarks)
     end)
     local chunks = {}
     for j, lens in ipairs(line_lenses) do
-      local text = lens.command and lens.command.title or 'Unresolved lens ...'
+      -- TODO make it optional; see vim.lsp.with
+      local padding = ''
+      if j == 1 then
+        padding = get_padding_lnum(bufnr, i)
+      end
+
+      local text = padding .. (lens.command and lens.command.title or 'Unresolved lens ...')
       table.insert(chunks, { text, 'LspCodeLens' })
       if j < #line_lenses then
         table.insert(chunks, { ' | ', 'LspCodeLensSeparator' })
