@@ -7,6 +7,16 @@ local M = {}
 --- to throttle refreshes to at most one at a time
 local active_refreshes = {}
 
+--- bufnr -> lnum -> extmark
+local extmarks_cache_by_buf = setmetatable({}, {
+  __index = function(t, b)
+    local key = b > 0 and b or api.nvim_get_current_buf()
+    t[key] = {}
+
+    return rawget(t, key)
+  end,
+})
+
 --- bufnr -> client_id -> lenses
 local lens_cache_by_buf = setmetatable({}, {
   __index = function(t, b)
@@ -75,6 +85,28 @@ function M.get(bufnr)
   return lenses
 end
 
+local function set_extmark(chunks, bufnr, i, ns, prev_extmarks)
+  local id = prev_extmarks and prev_extmarks[i]
+  local opts = {
+    id = id,
+    hl_mode = 'combine',
+    virt_text = chunks,
+  }
+
+  if id then
+    -- may raise 'line value outside range' outside range
+    local ok, _ = pcall(api.nvim_buf_set_extmark, bufnr, ns, i, 0, opts)
+    if not ok then
+      prev_extmarks[i] = nil
+    end
+
+    return
+  end
+
+  id = api.nvim_buf_set_extmark(bufnr, ns, i, 0, opts)
+  prev_extmarks[i] = id
+end
+
 --- Run the code lens in the current line
 ---
 function M.run()
@@ -108,12 +140,30 @@ function M.run()
   end
 end
 
+function M.display_line(line, bufnr, client_id, prev_extmarks)
+  local lenses_by_client = lens_cache_by_buf[bufnr]
+  if not lenses_by_client then
+    vim.notify('Codelens: tried to index lenses_by_client', vim.log.levels.ERROR)
+    return
+  end
+
+  local lenses = lenses_by_client[client_id]
+
+  local line_lenses = {}
+  for _, lens in pairs(lenses) do
+    if lens.range.start.line == line then
+      table.insert(line_lenses, lens)
+    end
+  end
+  M.display(line_lenses, bufnr, client_id, prev_extmarks)
+end
+
 --- Display the lenses using virtual text
 ---
 ---@param lenses table of lenses to display (`CodeLens[] | null`)
 ---@param bufnr number
 ---@param client_id number
-function M.display(lenses, bufnr, client_id)
+function M.display(lenses, bufnr, client_id, prev_extmarks)
   if not lenses or not next(lenses) then
     return
   end
@@ -127,27 +177,20 @@ function M.display(lenses, bufnr, client_id)
     table.insert(line_lenses, lens)
   end
   local ns = namespaces[client_id]
-  local num_lines = api.nvim_buf_line_count(bufnr)
-  for i = 0, num_lines do
-    local line_lenses = lenses_by_lnum[i] or {}
-    api.nvim_buf_clear_namespace(bufnr, ns, i, i + 1)
-    local chunks = {}
-    local num_line_lenses = #line_lenses
+  for i, line_lenses in pairs(lenses_by_lnum or {}) do
     table.sort(line_lenses, function(a, b)
       return a.range.start.character < b.range.start.character
     end)
+    local chunks = {}
     for j, lens in ipairs(line_lenses) do
       local text = lens.command and lens.command.title or 'Unresolved lens ...'
       table.insert(chunks, { text, 'LspCodeLens' })
-      if j < num_line_lenses then
+      if j < #line_lenses then
         table.insert(chunks, { ' | ', 'LspCodeLensSeparator' })
       end
     end
     if #chunks > 0 then
-      api.nvim_buf_set_extmark(bufnr, ns, i, 0, {
-        virt_text = chunks,
-        hl_mode = 'combine',
-      })
+      set_extmark(chunks, bufnr, i, ns, prev_extmarks)
     end
   end
 end
@@ -164,8 +207,9 @@ function M.save(lenses, bufnr, client_id)
     lens_cache_by_buf[bufnr] = lenses_by_client
     local ns = namespaces[client_id]
     api.nvim_buf_attach(bufnr, false, {
-      on_detach = function(b)
+      on_detach = function(_, b)
         lens_cache_by_buf[b] = nil
+        extmarks_cache_by_buf[b] = nil
       end,
       on_lines = function(_, b, _, first_lnum, last_lnum)
         api.nvim_buf_clear_namespace(b, ns, first_lnum, last_lnum)
@@ -176,7 +220,7 @@ function M.save(lenses, bufnr, client_id)
 end
 
 ---@private
-local function resolve_lenses(lenses, bufnr, client_id, callback)
+local function resolve_lenses(lenses, unresolved_lines, bufnr, client_id, callback, prev_extmarks)
   lenses = lenses or {}
   local num_lens = vim.tbl_count(lenses)
   if num_lens == 0 then
@@ -191,30 +235,72 @@ local function resolve_lenses(lenses, bufnr, client_id, callback)
       callback()
     end
   end
-  local ns = namespaces[client_id]
+
+  -- We can't simply display line after resolve.
+  -- If there exists a line with resolved lenses { a | b }. The next refresh call will eventually
+  -- lead to the following sequence { a | b } -> { a | Unresolved } -> { a | c }, which flickers
+  -- (regardless if c is equal to b or not).
+  --
+  -- We may update intermediate states if it's a new lens / the line hasn't been resolved yet.
+  -- Otherwise, refresh when its lenses have been resolved.
+  local num_lens_line = {}
+  for _, lens in pairs(lenses) do
+    local line = lens.range.start.line
+    local c = num_lens_line[line] or 0
+    num_lens_line[line] = c + 1
+  end
+
+  local function countdown_line(line)
+    num_lens_line[line] = num_lens_line[line] - 1
+    if unresolved_lines[line] or num_lens_line[line] == 0 then
+      M.display_line(line, bufnr, client_id, prev_extmarks)
+    end
+  end
+
   local client = vim.lsp.get_client_by_id(client_id)
   for _, lens in pairs(lenses or {}) do
     if lens.command then
       countdown()
     else
       client.request('codeLens/resolve', lens, function(_, result)
-        if result and result.command then
-          lens.command = result.command
-          -- Eager display to have some sort of incremental feedback
-          -- Once all lenses got resolved there will be a full redraw for all lenses
-          -- So that multiple lens per line are properly displayed
-          api.nvim_buf_set_extmark(
-            bufnr,
-            ns,
-            lens.range.start.line,
-            0,
-            { virt_text = { { lens.command.title, 'LspCodeLens' } }, hl_mode = 'combine' }
-          )
-        end
+        lens.command = result and result.command
+        -- Incremental display.
+        countdown_line(lens.range.start.line)
         countdown()
       end, bufnr)
     end
   end
+end
+
+local function diff(extmark, lnums)
+  local invalid = {}
+  local new = {}
+  for k, _ in pairs(extmark) do
+    if not lnums[k] then
+      table.insert(invalid, k)
+    end
+  end
+
+  for k, _ in pairs(lnums) do
+    if not extmark[k] then
+      new[k] = k
+    end
+  end
+
+  return invalid, new
+end
+
+local function lenses_by_lnum(bufnr, client_id)
+  if not lens_cache_by_buf[bufnr] then
+    lens_cache_by_buf[bufnr] = {}
+  end
+
+  local lnum_with_lens = {}
+  for _, lens in pairs(lens_cache_by_buf[bufnr][client_id] or {}) do
+    lnum_with_lens[lens.range.start.line] = true
+  end
+
+  return lnum_with_lens
 end
 
 --- |lsp-handler| for the method `textDocument/codeLens`
@@ -226,15 +312,43 @@ function M.on_codelens(err, result, ctx, _)
     return
   end
 
+  local extmarks = extmarks_cache_by_buf[ctx.bufnr]
+
   M.save(result, ctx.bufnr, ctx.client_id)
 
-  -- Eager display for any resolved (and unresolved) lenses and refresh them
-  -- once resolved.
-  M.display(result, ctx.bufnr, ctx.client_id)
-  resolve_lenses(result, ctx.bufnr, ctx.client_id, function()
+  -- TODO pass lnums_with_lenses to first display call ?
+  local invalid, new = diff(extmarks, lenses_by_lnum(ctx.bufnr, ctx.client_id))
+
+  for _, line in pairs(invalid) do
+    local id = extmarks[line]
+    extmarks[line] = nil
+
+    -- extmark might've changed position; if so, update our cache.
+    local row, _ =
+      unpack(api.nvim_buf_get_extmark_by_id(ctx.bufnr, namespaces[ctx.client_id], id, {}))
+    if row then
+      extmarks[row] = id
+    end
+
+    api.nvim_buf_clear_namespace(ctx.bufnr, namespaces[ctx.client_id], line, line + 1)
+  end
+
+  -- Display unresolved lenses and refresh them once resolved.
+  if not next(extmarks) or #vim.tbl_keys(new) > 0 then
+    local unresolved = {}
+    for _, lens in pairs(result or {}) do
+      local line = lens.range.start.line
+      if new[line] then
+        table.insert(unresolved, lens)
+        api.nvim_buf_clear_namespace(ctx.bufnr, namespaces[ctx.client_id], line, line + 1)
+      end
+    end
+    M.display(unresolved, ctx.bufnr, ctx.client_id, extmarks)
+  end
+
+  resolve_lenses(result, new, ctx.bufnr, ctx.client_id, function()
     active_refreshes[ctx.bufnr] = nil
-    M.display(result, ctx.bufnr, ctx.client_id)
-  end)
+  end, extmarks)
 end
 
 --- Refresh the codelens for the current buffer
